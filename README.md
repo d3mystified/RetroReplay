@@ -38,6 +38,8 @@ plex:
 tmdb:
   access_token: reallylongstring  # Get from https://www.themoviedb.org/settings/api
   api_key: abc123  # Get from https://www.themoviedb.org/settings/api
+healthchecks:
+  base_url: https://hc-ping.com/12345678-1234-1234-1234-123456789012
 ```
 
 ### Docker Compose

@@ -1,8 +1,11 @@
 import argparse
+import uuid
+import sys
 import time
 from datetime import datetime, timedelta
 import os
 import yaml
+from io import StringIO
 
 from urllib3.util.retry import Retry
 import schedule
@@ -19,148 +22,203 @@ DEFAULT_RUN_AT = "02:00"
 DEFAULT_TZ = "UTC"
 
 
+def hc_ping(url: str, endpoint: str = "", payload: str = None, rid: str = None) -> None:
+    """
+    Lightweight helper to ping Healthchecks.io endpoints.
+    `url` is the base ping URL (e.g. https://hc-ping.com/<uuid>).
+    `endpoint` is one of: "", "/start", "/fail" or "/<exit-code>".
+    `payload` is optional text to send in the request body (for /success or /fail).
+    `rid` is an optional run ID (UUID) to correlate start/finish pings.
+    """
+    if not url:
+        return
+
+    full_url = url.rstrip("/") + endpoint
+    params = {}
+    if rid:
+        params["rid"] = rid
+
+    try:
+        if payload is not None:
+            requests.post(full_url, params=params, data=payload, timeout=10)
+        else:
+            requests.get(full_url, params=params, timeout=10)
+    except requests.RequestException:
+        # Silently ignore HC network issues so the main script keeps running
+        pass
+
+
 def run(run_at: str = None):
-    if run_at:
-        print(f"Running at scheduled {run_at} time...")
-    else:
-        print("Running immediately...")
+    rid = str(uuid.uuid4())  # Unique run ID for this invocation
+    hc_url = None
 
-    # Record start time
-    start_time = datetime.now()
-
-    # Load configuration
+    # Load config early so we can extract HC URL for this run
     with open(CONFIG_FILE, 'r') as file:
         config = yaml.safe_load(file)
+    hc_url = config.get("healthchecks", {}).get("base_url")
 
-    # Initialize TMDb client
-    tmdb_config = config['tmdb']
-    tmdb = TMDbAPIs(tmdb_config['api_key'], v4_access_token=tmdb_config.get('authenticated_token') or tmdb_config.get('access_token'))
+    if hc_url:
+        hc_ping(hc_url, "/start", rid=rid)
 
-    if not tmdb_config.get('authenticated_token'):
-        print("No authenticated token found. Starting TMDb authentication.")
-        print(tmdb.v4_authenticate())
-        input("Navigate to the URL and then hit enter when Authenticated")
-        tmdb.v4_approved()
-        tmdb_config['authenticated_token'] = tmdb.v4_access_token
-        with open(CONFIG_FILE, "w") as f:
-            yaml.dump(config, f)
-        print("Authenticated token saved to config.yml")
-    else:
-        print("Authenticated token loaded from file.")
+    # Capture stdout/stderr for logging
+    old_stdout = sys.stdout
+    old_stderr = sys.stderr
+    captured_output = StringIO()
+    try:
+        sys.stdout = captured_output
+        sys.stderr = captured_output
 
-    # Initialize Plex client
-    plex = PlexServer(config['plex']['url'], config['plex']['token'])
+        if run_at:
+            print(f"Running at scheduled {run_at} time...")
+        else:
+            print("Running immediately...")
 
-    def make_request_with_retry(url, method="POST", data=None, headers=None):
-        """Makes a request with retry policy for 5xx errors, supporting GET and POST."""
+        # Record start time
+        start_time = datetime.now()
 
-        retries = Retry(total=5, backoff_factor=0.1, status_forcelist=[500, 502, 503, 504],
-                        allowed_methods=["GET", "POST"])
-        adapter = HTTPAdapter(max_retries=retries)
-        http = requests.Session()
-        http.mount("https://", adapter)
+        # Initialize TMDb client
+        tmdb_config = config['tmdb']
+        tmdb = TMDbAPIs(tmdb_config['api_key'], v4_access_token=tmdb_config.get('authenticated_token') or tmdb_config.get('access_token'))
 
-        try:
-            if method.upper() == "POST":
-                response = http.post(url, data=data, headers=headers)
-            elif method.upper() == "GET":
-                response = http.get(url, params=data, headers=headers)
-            else:
-                raise ValueError("Invalid HTTP method. Must be 'GET' or 'POST'.")
+        if not tmdb_config.get('authenticated_token'):
+            print("No authenticated token found. Starting TMDb authentication.")
+            print(tmdb.v4_authenticate())
+            input("Navigate to the URL and then hit enter when Authenticated")
+            tmdb.v4_approved()
+            tmdb_config['authenticated_token'] = tmdb.v4_access_token
+            with open(CONFIG_FILE, "w") as f:
+                yaml.dump(config, f)
+            print("Authenticated token saved to config.yml")
+        else:
+            print("Authenticated token loaded from file.")
 
-            response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            print(f"Request failed after multiple retries: {e}")
-            return None
+        # Initialize Plex client
+        plex = PlexServer(config['plex']['url'], config['plex']['token'])
 
-    def should_include_media(mdblist_type, tmdb_id, imdb_min_rating, imdb_min_votes):
-        """Determines if media should be included based on IMDb ratings."""
+        def make_request_with_retry(url, method="POST", data=None, headers=None):
+            """Makes a request with retry policy for 5xx errors, supporting GET and POST."""
 
-        headers = {'Content-Type': 'application/json'}
-        url = f'{MDBLIST_BASE_URL}/tmdb/{mdblist_type}/{tmdb_id}?apikey={config["mdblist"]["api_key"]}'
-        response = make_request_with_retry(url, method="GET", headers=headers)
+            retries = Retry(total=5, backoff_factor=0.1, status_forcelist=[500, 502, 503, 504],
+                            allowed_methods=["GET", "POST"])
+            adapter = HTTPAdapter(max_retries=retries)
+            http = requests.Session()
+            http.mount("https://", adapter)
 
-        if not response:
-            return False
+            try:
+                if method.upper() == "POST":
+                    response = http.post(url, data=data, headers=headers)
+                elif method.upper() == "GET":
+                    response = http.get(url, params=data, headers=headers)
+                else:
+                    raise ValueError("Invalid HTTP method. Must be 'GET' or 'POST'.")
 
-        imdb_rating = next((r for r in response.get('ratings', []) if r["source"] == "imdb"), None)
+                response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
+                return response.json()
+            except requests.exceptions.RequestException as e:
+                print(f"Request failed after multiple retries: {e}")
+                return None
 
-        if not imdb_rating:
-            return False
+        def should_include_media(mdblist_type, tmdb_id, imdb_min_rating, imdb_min_votes):
+            """Determines if media should be included based on IMDb ratings."""
 
-        score = imdb_rating.get('score')
-        votes = imdb_rating.get('votes')
+            headers = {'Content-Type': 'application/json'}
+            url = f'{MDBLIST_BASE_URL}/tmdb/{mdblist_type}/{tmdb_id}?apikey={config["mdblist"]["api_key"]}'
+            response = make_request_with_retry(url, method="GET", headers=headers)
 
-        if score is None or votes is None:
-            return False
+            if not response:
+                return False
 
-        return score >= imdb_min_rating or votes >= imdb_min_votes  # Modified condition to OR
+            imdb_rating = next((r for r in response.get('ratings', []) if r["source"] == "imdb"), None)
 
-    # Check MDBList API limits (only once)
-    limits = make_request_with_retry(f'{MDBLIST_BASE_URL}/user?apikey={config["mdblist"]["api_key"]}', method="GET", headers={'Content-Type': 'application/json'})
-    print(f'MDBList API limits = {limits}')
+            if not imdb_rating:
+                return False
 
-    for library_name, library_config in config["libraries"].items():
-        print(f"\n============================\nWorking on library {library_name}")
+            score = imdb_rating.get('score')
+            votes = imdb_rating.get('votes')
 
-        today = datetime.now()
-        date_range_type = library_config.get("range", "day")  # Default to "day"
+            if score is None or votes is None:
+                return False
 
-        if date_range_type == 'week':
-            start_date = today - timedelta(days=today.weekday())
-            end_date = start_date + timedelta(days=6)
-        elif date_range_type == 'month':
-            start_date = today.replace(day=1)
-            end_date = (start_date.replace(month=start_date.month + 1, day=1) - timedelta(days=1)) if start_date.month < 12 else start_date.replace(day=31)
-        else:  # Day or other invalid value
-            start_date = today
-            end_date = today
+            return score >= imdb_min_rating or votes >= imdb_min_votes  # Modified condition to OR
 
-        print(f'Date range: {start_date.strftime("%Y-%m-%d")} to {end_date.strftime("%Y-%m-%d")}')
+        # Check MDBList API limits (only once)
+        limits = make_request_with_retry(f'{MDBLIST_BASE_URL}/user?apikey={config["mdblist"]["api_key"]}', method="GET", headers={'Content-Type': 'application/json'})
+        print(f'MDBList API limits = {limits}')
 
-        candidate_date_ranges = []
-        for year in range(library_config["starting_year"], today.year + 1):  # Use today.year
-            year_start = datetime(year, start_date.month, start_date.day)
-            year_end = datetime(year, end_date.month, end_date.day)
+        for library_name, library_config in config["libraries"].items():
+            print(f"\n============================\nWorking on library {library_name}")
 
-            if year_start <= year_end:
-                candidate_date_ranges.append((year_start.strftime('%Y-%m-%d'), year_end.strftime('%Y-%m-%d')))
+            today = datetime.now()
+            date_range_type = library_config.get("range", "day")  # Default to "day"
 
-        plex_library = plex.library.section(library_name)
-        media_type = plex_library.type  # Use plex_library.type directly
+            if date_range_type == 'week':
+                start_date = today - timedelta(days=today.weekday())
+                end_date = start_date + timedelta(days=6)
+            elif date_range_type == 'month':
+                start_date = today.replace(day=1)
+                end_date = (start_date.replace(month=start_date.month + 1, day=1) - timedelta(days=1)) if start_date.month < 12 else start_date.replace(day=31)
+            else:  # Day or other invalid value
+                start_date = today
+                end_date = today
 
-        mdblist_type = 'show' if media_type == 'show' else 'movie'
-        tmdb_type = "tv" if media_type == 'show' else "movie"
+            print(f'Date range: {start_date.strftime("%Y-%m-%d")} to {end_date.strftime("%Y-%m-%d")}')
 
-        tmdb_list = tmdb.list(library_config["tmdb_list_id"])
-        print(f'Clearing list {library_config["tmdb_list_id"]}')
-        tmdb_list.clear()
+            candidate_date_ranges = []
+            for year in range(library_config["starting_year"], today.year + 1):  # Use today.year
+                year_start = datetime(year, start_date.month, start_date.day)
+                year_end = datetime(year, end_date.month, end_date.day)
 
-        for search_start, search_end in candidate_date_ranges:
-            print(f'\nSearching between {search_start} and {search_end}')
-            search_results = plex_library.search(filters={"originallyAvailableAt>>": [search_start], "originallyAvailableAt<<": [search_end]})
-            print(f'Found {len(search_results)} items in range')
+                if year_start <= year_end:
+                    candidate_date_ranges.append((year_start.strftime('%Y-%m-%d'), year_end.strftime('%Y-%m-%d')))
 
-            tmdb_payload = []
-            for item in search_results:  # More descriptive variable name
-                for guid in item.guids:
-                    if guid.id.startswith("tmdb://"):
-                        tmdb_id = guid.id[7:]
-                        if should_include_media(mdblist_type, tmdb_id, library_config["imdb_min_rating"], library_config["imdb_min_votes"]):
-                            tmdb_payload.append((tmdb_id, tmdb_type))
+            plex_library = plex.library.section(library_name)
+            media_type = plex_library.type  # Use plex_library.type directly
 
-            tmdb_list.add_items(items=tmdb_payload)
-            print(f'Added {len(tmdb_payload)} items to list {library_config["tmdb_list_id"]}')
+            mdblist_type = 'show' if media_type == 'show' else 'movie'
+            tmdb_type = "tv" if media_type == 'show' else "movie"
 
-    # Calculate and print elapsed time
-    end_time = datetime.now()
-    elapsed_time = end_time - start_time
+            tmdb_list = tmdb.list(library_config["tmdb_list_id"])
+            print(f'Clearing list {library_config["tmdb_list_id"]}')
+            tmdb_list.clear()
 
-    hours, remainder = divmod(int(elapsed_time.total_seconds()), 3600)
-    minutes, seconds = divmod(remainder, 60)
+            for search_start, search_end in candidate_date_ranges:
+                print(f'\nSearching between {search_start} and {search_end}')
+                search_results = plex_library.search(filters={"originallyAvailableAt>>": [search_start], "originallyAvailableAt<<": [search_end]})
+                print(f'Found {len(search_results)} items in range')
 
-    print(f"\nScript execution time: {hours} hours, {minutes} minutes, {seconds} seconds")
+                tmdb_payload = []
+                for item in search_results:  # More descriptive variable name
+                    for guid in item.guids:
+                        if guid.id.startswith("tmdb://"):
+                            tmdb_id = guid.id[7:]
+                            if should_include_media(mdblist_type, tmdb_id, library_config["imdb_min_rating"], library_config["imdb_min_votes"]):
+                                tmdb_payload.append((tmdb_id, tmdb_type))
+
+                tmdb_list.add_items(items=tmdb_payload)
+                print(f'Added {len(tmdb_payload)} items to list {library_config["tmdb_list_id"]}')
+
+        # Calculate and print elapsed time
+        end_time = datetime.now()
+        elapsed_time = end_time - start_time
+
+        hours, remainder = divmod(int(elapsed_time.total_seconds()), 3600)
+        minutes, seconds = divmod(remainder, 60)
+
+        print(f"\nScript execution time: {hours} hours, {minutes} minutes, {seconds} seconds")
+
+        # Signal success
+        if hc_url:
+            hc_ping(hc_url, "/0", payload=captured_output.getvalue(), rid=rid)
+
+    except Exception as exc:
+        # Log the error to HC and re-raise so the exit code is non-zero
+        if hc_url:
+            hc_ping(hc_url, "/fail", payload=captured_output.getvalue(), rid=rid)
+        raise
+    finally:
+        sys.stdout = old_stdout
+        sys.stderr = old_stderr
+        print(captured_output.getvalue())
 
 
 def print_current_time_and_schedule(timezone, run_at: str):
@@ -172,7 +230,6 @@ def print_current_time_and_schedule(timezone, run_at: str):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--run", action="store_true")
-    parser.parse_args()
     args = parser.parse_args()
 
     if args.run:  # Run once immediately and exit if configured accordingly
